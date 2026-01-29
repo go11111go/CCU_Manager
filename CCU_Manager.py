@@ -86,36 +86,63 @@ def _init_status_icons(master):
 # UTILITY
 # ============================================================
 
-_game_name_cache = {}
+class GameNameCache:
+    """Thread-safe singleton cache for Steam game names."""
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                # Double-check locking pattern
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._cache = {}
+                    cls._instance._cache_lock = threading.Lock()
+        return cls._instance
+    
+    def get(self, app_id: int, timeout=2):
+        """Get game name from cache or fetch from Steam API."""
+        with self._cache_lock:
+            if app_id in self._cache:
+                return self._cache[app_id]
+        
+        try:
+            url = "https://store.steampowered.com/api/appdetails"
+            resp = requests.get(
+                url,
+                params={"appids": app_id, "l": "ru"},
+                timeout=timeout
+            )
+            data = resp.json()
+            app_data = data.get(str(app_id), {})
+            if app_data.get("success"):
+                name = app_data["data"].get("name")
+                if name:
+                    with self._cache_lock:
+                        self._cache[app_id] = name
+                    return name
+        except Exception as e:
+            print(f"Warning: Failed to fetch game name for app_id {app_id}: {e}")
+        
+        return None
+
+
+# Module-level singleton instance for efficient access
+_game_name_cache_instance = GameNameCache()
+
 
 def get_game_name(app_id: int, timeout=2):
-    if app_id in _game_name_cache:
-        return _game_name_cache[app_id]
+    """Fetch game name from Steam API with caching."""
+    return _game_name_cache_instance.get(app_id, timeout)
 
-    try:
-        url = "https://store.steampowered.com/api/appdetails"
-        resp = requests.get(
-            url,
-            params={"appids": app_id, "l": "ru"},
-            timeout=timeout
-        )
-        data = resp.json()
-        app_data = data.get(str(app_id), {})
-        if app_data.get("success"):
-            name = app_data["data"].get("name")
-            if name:
-                _game_name_cache[app_id] = name
-                return name
-    except Exception:
-        pass
-
-    return None
 
 def _now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _ensure_http(url: str) -> str:
+    """Ensure URL has http:// or https:// prefix."""
     u = (url or "").strip()
     if not u:
         return u
@@ -124,23 +151,33 @@ def _ensure_http(url: str) -> str:
     return "http://" + u
 
 
-def _parse_hhmm(s: str) -> Optional[int]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    if ":" not in s:
-        return None
-    parts = s.split(":")
-    if len(parts) != 2:
-        return None
-    h, m = parts[0].strip(), parts[1].strip()
-    if not (h.isdigit() and m.isdigit()):
-        return None
-    hh = int(h)
-    mm = int(m)
-    if mm >= 60:
-        return None
-    return hh * 3600 + mm * 60
+def _make_request(method: str, base_url: str, path: str, ipc_password: str, 
+                   timeout: int = 10, json_payload=None):
+    """
+    Helper to make HTTP requests and handle common error cases.
+    Returns (success: bool, response_or_none, data_or_none, error_message_or_none).
+    - On connection error: (False, None, None, error_message)
+    - On JSON parse error: (False, response, None, error_message)
+    - On success: (True, response, data, None)
+    """
+    url = _ensure_http(base_url).rstrip("/") + path
+    headers = _auth_headers(ipc_password)
+    
+    try:
+        if method.upper() == "POST":
+            resp = requests.post(url, headers=headers, json=json_payload, timeout=timeout)
+        else:  # GET
+            resp = requests.get(url, headers=headers, timeout=timeout)
+    except requests.RequestException as e:
+        return False, None, None, f"Connection error: {e}"
+    
+    try:
+        data = resp.json()
+        return True, resp, data, None
+    except (ValueError, requests.exceptions.JSONDecodeError) as e:
+        return False, resp, None, f"Invalid JSON (HTTP {resp.status_code}): {resp.text[:300]}"
+
+
 
 
 def _fmt_duration(seconds: int) -> str:
@@ -196,34 +233,35 @@ def load_json_config(path: str, default_obj: Optional[Dict[str, Any]] = None) ->
             data = json.load(f)
         if isinstance(data, dict):
             return data
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: Failed to load config from {path}: {e}")
     try:
         bak = path + ".broken_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bak"
         if os.path.exists(path):
             try:
                 os.replace(path, bak)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Warning: Failed to backup broken config {path}: {e}")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(default_obj, f, ensure_ascii=False, indent=4)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error: Failed to recreate config {path}: {e}")
     return default_obj.copy()
 
 
 def save_json_config(path: str, obj: Dict[str, Any]) -> None:
+    """Save JSON config with atomic write for data safety."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: Failed to create config directory for {path}: {e}")
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=4)
         os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error: Failed to save config to {path}: {e}")
 
 
 def default_config_ccu() -> Dict[str, Any]:
@@ -268,39 +306,33 @@ def _auth_headers(ipc_password: str) -> Dict[str, str]:
 
 
 def send_command(base_url: str, command: str, ipc_password: str, timeout: int = 10) -> Tuple[bool, str]:
-    url = _ensure_http(base_url).rstrip("/") + "/Api/Command"
+    """Send command to ASF API."""
     payload = {"Command": command}
-    try:
-        resp = requests.post(url, headers=_auth_headers(ipc_password), json=payload, timeout=timeout)
-    except requests.RequestException as e:
-        return False, f"Connection error: {e}"
-    try:
-        data = resp.json()
-    except ValueError:
-        return False, f"Invalid JSON (HTTP {resp.status_code}): {resp.text[:300]}"
-    success = bool(data.get("Success", resp.ok))
+    success, resp, data, error_msg = _make_request("POST", base_url, "/Api/Command", ipc_password, timeout, payload)
+    
+    if not success:
+        return False, error_msg
+    
+    cmd_success = bool(data.get("Success", resp.ok))
     message = data.get("Message")
-    result = data.get("Result")
+    cmd_result = data.get("Result")
     parts: List[str] = [f"HTTP {resp.status_code}"]
     if message:
         parts.append(str(message))
-    if result is not None and result != "":
-        parts.append(str(result)[:200])
+    if cmd_result is not None and cmd_result != "":
+        parts.append(str(cmd_result)[:200])
     if len(parts) == 1:
         parts.append(str(data)[:200])
-    return success, " | ".join(parts)
+    return cmd_success, " | ".join(parts)
 
 
 def _get_json(base_url: str, path: str, ipc_password: str, timeout: int = 10) -> Tuple[bool, Any, str]:
-    url = _ensure_http(base_url).rstrip("/") + path
-    try:
-        resp = requests.get(url, headers=_auth_headers(ipc_password), timeout=timeout)
-    except requests.RequestException as e:
-        return False, None, f"{path}: Connection error: {e}"
-    try:
-        data = resp.json()
-    except ValueError:
-        return False, None, f"{path}: Invalid JSON (HTTP {resp.status_code}): {resp.text[:200]}"
+    """Get JSON data from ASF API."""
+    success, resp, data, error_msg = _make_request("GET", base_url, path, ipc_password, timeout)
+    
+    if not success:
+        return False, None, f"{path}: {error_msg}"
+    
     if isinstance(data, dict):
         ok = bool(data.get("Success", resp.ok))
         msg = str(data.get("Message", "")) if isinstance(data.get("Message", ""), (str, int, float)) else ""
@@ -334,7 +366,7 @@ def fast_port_check(host, port, timeout=0.3):
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
-    except:
+    except Exception:
         return False
 
 
@@ -1083,7 +1115,7 @@ class TimeSpinnerSeparate(ttk.Frame):
         try:
             h, m = map(int, val.split(":"))
             return max(0, min(23, h)), max(0, min(59, m))
-        except:
+        except (ValueError, AttributeError):
             return 0, 0
 
     def _inc_h(self):
@@ -1150,7 +1182,7 @@ class NumberSpinner(ttk.Frame):
     def _increment(self):
         try:
             val = int(self.var.get()) + 1
-        except:
+        except (ValueError, TypeError):
             val = 0
         if self.max_val is not None:
             val = min(val, self.max_val)
@@ -1159,7 +1191,7 @@ class NumberSpinner(ttk.Frame):
     def _decrement(self):
         try:
             val = int(self.var.get()) - 1
-        except:
+        except (ValueError, TypeError):
             val = 0
         if self.min_val is not None:
             val = max(val, self.min_val)
@@ -1564,43 +1596,46 @@ class ConfigEditorCCU(tk.Toplevel):
         self.spin_base_days.grid(row=6, column=1, sticky="w", pady=2)
 
         # MIDDLE: randomize & delay
-        self.rand_var = tk.IntVar(value=1 if self.config_data.get("randomize", {}).get("enabled", False) else 0)
+        randomize_cfg = self.config_data.get("randomize", {})
+        self.rand_var = tk.IntVar(value=1 if randomize_cfg.get("enabled", False) else 0)
         self.chk_random = ttk.Checkbutton(middle, text="Рандомизация", variable=self.rand_var,
                                           style="Bold.TCheckbutton")
         self.chk_random.grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Label(middle, text="Тип:").grid(row=1, column=0, sticky="w", pady=2)
-        self.rand_type = tk.StringVar(value=self.config_data.get("randomize", {}).get("type", "percentage"))
+        self.rand_type = tk.StringVar(value=randomize_cfg.get("type", "percentage"))
         self.combo_rand_type = ttk.Combobox(middle, values=["Проценты", "Значения"], textvariable=self.rand_type,
                                             width=12, state="readonly")
         self.combo_rand_type.grid(row=1, column=1, sticky="w", pady=2)
 
         ttk.Label(middle, text="Мин:").grid(row=2, column=0, sticky="w", pady=2)
-        self.spin_rand_min = NumberSpinner(middle, initial_value=self.config_data.get("randomize", {}).get("min", -15),
+        self.spin_rand_min = NumberSpinner(middle, initial_value=randomize_cfg.get("min", -15),
                                            width=6)
         self.spin_rand_min.grid(row=2, column=1, sticky="w", pady=2)
 
         ttk.Label(middle, text="Макс:").grid(row=3, column=0, sticky="w", pady=2)
-        self.spin_rand_max = NumberSpinner(middle, initial_value=self.config_data.get("randomize", {}).get("max", 15),
+        self.spin_rand_max = NumberSpinner(middle, initial_value=randomize_cfg.get("max", 15),
                                            width=6)
         self.spin_rand_max.grid(row=3, column=1, sticky="w", pady=2)
 
-        self.delay_var = tk.IntVar(value=1 if self.config_data.get("delay", {}).get("enabled", False) else 0)
+        delay_cfg = self.config_data.get("delay", {})
+        self.delay_var = tk.IntVar(value=1 if delay_cfg.get("enabled", False) else 0)
         self.chk_delay = ttk.Checkbutton(middle, text="Задержка", variable=self.delay_var, style="Bold.TCheckbutton")
         self.chk_delay.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
         ttk.Label(middle, text="После пика:").grid(row=5, column=0, sticky="w", pady=2)
-        self.delay_after_peak = TimeSpinnerSeparate(middle, initial_value=self.config_data.get("delay", {}).get(
+        self.delay_after_peak = TimeSpinnerSeparate(middle, initial_value=delay_cfg.get(
             "delay_after_peak", "00:00"))
         self.delay_after_peak.grid(row=5, column=1, sticky="w", pady=2)
 
         ttk.Label(middle, text="После дна:").grid(row=6, column=0, sticky="w", pady=2)
-        self.delay_after_bottom = TimeSpinnerSeparate(middle, initial_value=self.config_data.get("delay", {}).get(
+        self.delay_after_bottom = TimeSpinnerSeparate(middle, initial_value=delay_cfg.get(
             "delay_after_bottom", "00:00"))
         self.delay_after_bottom.grid(row=6, column=1, sticky="w", pady=2)
 
         # RIGHT: gradual decay (additional days)
-        self.gradual_var = tk.IntVar(value=1 if self.config_data.get("gradual_decay", {}).get("enabled", False) else 0)
+        gradual_cfg = self.config_data.get("gradual_decay", {})
+        self.gradual_var = tk.IntVar(value=1 if gradual_cfg.get("enabled", False) else 0)
         self.chk_gradual = ttk.Checkbutton(right, text="Включить", variable=self.gradual_var)
         self.chk_gradual.pack(anchor="nw")
 
@@ -1611,7 +1646,7 @@ class ConfigEditorCCU(tk.Toplevel):
         self.gradual_days_container.pack(fill=tk.BOTH, expand=True)
 
         # load existing additional_days
-        additional_days = self.config_data.get("gradual_decay", {}).get("additional_days", [])
+        additional_days = gradual_cfg.get("additional_days", [])
         for day in additional_days:
             self._add_gradual_row(day.get("peak", 0), day.get("bottom", 0))
         # one empty by default
@@ -1720,14 +1755,14 @@ class ConfigEditorCCU(tk.Toplevel):
                     n = r["name"].get()
                     if n.startswith("GAME_"):
                         last_idx = max(last_idx, int(n.replace("GAME_", "")))
-                except:
+                except (ValueError, AttributeError, KeyError):
                     pass
 
                 try:
                     u = r["url"].get()
                     if ":" in u:
                         last_port = max(last_port, int(u.split(":")[-1]))
-                except:
+                except (ValueError, AttributeError, KeyError):
                     pass
 
             name = f"GAME_{last_idx + 1}"
