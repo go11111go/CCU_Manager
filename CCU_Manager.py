@@ -87,19 +87,25 @@ def _init_status_icons(master):
 # ============================================================
 
 class GameNameCache:
-    """Singleton cache for Steam game names."""
+    """Thread-safe singleton cache for Steam game names."""
     _instance = None
+    _lock = threading.Lock()
     
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._cache = {}
+            with cls._lock:
+                # Double-check locking pattern
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._cache = {}
+                    cls._instance._cache_lock = threading.Lock()
         return cls._instance
     
     def get(self, app_id: int, timeout=2):
         """Get game name from cache or fetch from Steam API."""
-        if app_id in self._cache:
-            return self._cache[app_id]
+        with self._cache_lock:
+            if app_id in self._cache:
+                return self._cache[app_id]
         
         try:
             url = "https://store.steampowered.com/api/appdetails"
@@ -113,7 +119,8 @@ class GameNameCache:
             if app_data.get("success"):
                 name = app_data["data"].get("name")
                 if name:
-                    self._cache[app_id] = name
+                    with self._cache_lock:
+                        self._cache[app_id] = name
                     return name
         except Exception as e:
             print(f"Warning: Failed to fetch game name for app_id {app_id}: {e}")
@@ -121,10 +128,13 @@ class GameNameCache:
         return None
 
 
+# Module-level singleton instance for efficient access
+_game_name_cache_instance = GameNameCache()
+
+
 def get_game_name(app_id: int, timeout=2):
     """Fetch game name from Steam API with caching."""
-    cache = GameNameCache()
-    return cache.get(app_id, timeout)
+    return _game_name_cache_instance.get(app_id, timeout)
 
 
 def _now_ts() -> str:
@@ -145,7 +155,10 @@ def _make_request(method: str, base_url: str, path: str, ipc_password: str,
                    timeout: int = 10, json_payload=None):
     """
     Helper to make HTTP requests and handle common error cases.
-    Returns (response, error_message) tuple.
+    Returns (success: bool, response_or_none, data_or_none, error_message_or_none).
+    - On connection error: (False, None, None, error_message)
+    - On JSON parse error: (False, response, None, error_message)
+    - On success: (True, response, data, None)
     """
     url = _ensure_http(base_url).rstrip("/") + path
     headers = _auth_headers(ipc_password)
@@ -156,13 +169,13 @@ def _make_request(method: str, base_url: str, path: str, ipc_password: str,
         else:  # GET
             resp = requests.get(url, headers=headers, timeout=timeout)
     except requests.RequestException as e:
-        return None, f"Connection error: {e}"
+        return False, None, None, f"Connection error: {e}"
     
     try:
         data = resp.json()
-        return resp, data, None
-    except ValueError:
-        return resp, None, f"Invalid JSON (HTTP {resp.status_code}): {resp.text[:300]}"
+        return True, resp, data, None
+    except (ValueError, requests.exceptions.JSONDecodeError) as e:
+        return False, resp, None, f"Invalid JSON (HTTP {resp.status_code}): {resp.text[:300]}"
 
 
 
@@ -295,17 +308,12 @@ def _auth_headers(ipc_password: str) -> Dict[str, str]:
 def send_command(base_url: str, command: str, ipc_password: str, timeout: int = 10) -> Tuple[bool, str]:
     """Send command to ASF API."""
     payload = {"Command": command}
-    result = _make_request("POST", base_url, "/Api/Command", ipc_password, timeout, payload)
+    success, resp, data, error_msg = _make_request("POST", base_url, "/Api/Command", ipc_password, timeout, payload)
     
-    if len(result) == 2:  # Error case
-        _, error_msg = result
+    if not success:
         return False, error_msg
     
-    resp, data, error_msg = result
-    if error_msg:
-        return False, error_msg
-    
-    success = bool(data.get("Success", resp.ok))
+    cmd_success = bool(data.get("Success", resp.ok))
     message = data.get("Message")
     cmd_result = data.get("Result")
     parts: List[str] = [f"HTTP {resp.status_code}"]
@@ -315,19 +323,14 @@ def send_command(base_url: str, command: str, ipc_password: str, timeout: int = 
         parts.append(str(cmd_result)[:200])
     if len(parts) == 1:
         parts.append(str(data)[:200])
-    return success, " | ".join(parts)
+    return cmd_success, " | ".join(parts)
 
 
 def _get_json(base_url: str, path: str, ipc_password: str, timeout: int = 10) -> Tuple[bool, Any, str]:
     """Get JSON data from ASF API."""
-    result = _make_request("GET", base_url, path, ipc_password, timeout)
+    success, resp, data, error_msg = _make_request("GET", base_url, path, ipc_password, timeout)
     
-    if len(result) == 2:  # Error case
-        _, error_msg = result
-        return False, None, f"{path}: {error_msg}"
-    
-    resp, data, error_msg = result
-    if error_msg:
+    if not success:
         return False, None, f"{path}: {error_msg}"
     
     if isinstance(data, dict):
