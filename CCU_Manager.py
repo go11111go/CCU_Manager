@@ -89,6 +89,7 @@ def _init_status_icons(master):
 _game_name_cache = {}
 
 def get_game_name(app_id: int, timeout=2):
+    """Fetch game name from Steam API with caching."""
     if app_id in _game_name_cache:
         return _game_name_cache[app_id]
 
@@ -106,8 +107,8 @@ def get_game_name(app_id: int, timeout=2):
             if name:
                 _game_name_cache[app_id] = name
                 return name
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: Failed to fetch game name for app_id {app_id}: {e}")
 
     return None
 
@@ -116,6 +117,7 @@ def _now_ts() -> str:
 
 
 def _ensure_http(url: str) -> str:
+    """Ensure URL has http:// or https:// prefix."""
     u = (url or "").strip()
     if not u:
         return u
@@ -124,23 +126,30 @@ def _ensure_http(url: str) -> str:
     return "http://" + u
 
 
-def _parse_hhmm(s: str) -> Optional[int]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    if ":" not in s:
-        return None
-    parts = s.split(":")
-    if len(parts) != 2:
-        return None
-    h, m = parts[0].strip(), parts[1].strip()
-    if not (h.isdigit() and m.isdigit()):
-        return None
-    hh = int(h)
-    mm = int(m)
-    if mm >= 60:
-        return None
-    return hh * 3600 + mm * 60
+def _make_request(method: str, base_url: str, path: str, ipc_password: str, 
+                   timeout: int = 10, json_payload=None):
+    """
+    Helper to make HTTP requests and handle common error cases.
+    Returns (response, error_message) tuple.
+    """
+    url = _ensure_http(base_url).rstrip("/") + path
+    headers = _auth_headers(ipc_password)
+    
+    try:
+        if method.upper() == "POST":
+            resp = requests.post(url, headers=headers, json=json_payload, timeout=timeout)
+        else:  # GET
+            resp = requests.get(url, headers=headers, timeout=timeout)
+    except requests.RequestException as e:
+        return None, f"Connection error: {e}"
+    
+    try:
+        data = resp.json()
+        return resp, data, None
+    except ValueError:
+        return resp, None, f"Invalid JSON (HTTP {resp.status_code}): {resp.text[:300]}"
+
+
 
 
 def _fmt_duration(seconds: int) -> str:
@@ -196,34 +205,35 @@ def load_json_config(path: str, default_obj: Optional[Dict[str, Any]] = None) ->
             data = json.load(f)
         if isinstance(data, dict):
             return data
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: Failed to load config from {path}: {e}")
     try:
         bak = path + ".broken_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bak"
         if os.path.exists(path):
             try:
                 os.replace(path, bak)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Warning: Failed to backup broken config {path}: {e}")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(default_obj, f, ensure_ascii=False, indent=4)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error: Failed to recreate config {path}: {e}")
     return default_obj.copy()
 
 
 def save_json_config(path: str, obj: Dict[str, Any]) -> None:
+    """Save JSON config with atomic write for data safety."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: Failed to create config directory for {path}: {e}")
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=4)
         os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error: Failed to save config to {path}: {e}")
 
 
 def default_config_ccu() -> Dict[str, Any]:
@@ -268,39 +278,43 @@ def _auth_headers(ipc_password: str) -> Dict[str, str]:
 
 
 def send_command(base_url: str, command: str, ipc_password: str, timeout: int = 10) -> Tuple[bool, str]:
-    url = _ensure_http(base_url).rstrip("/") + "/Api/Command"
+    """Send command to ASF API."""
     payload = {"Command": command}
-    try:
-        resp = requests.post(url, headers=_auth_headers(ipc_password), json=payload, timeout=timeout)
-    except requests.RequestException as e:
-        return False, f"Connection error: {e}"
-    try:
-        data = resp.json()
-    except ValueError:
-        return False, f"Invalid JSON (HTTP {resp.status_code}): {resp.text[:300]}"
+    result = _make_request("POST", base_url, "/Api/Command", ipc_password, timeout, payload)
+    
+    if len(result) == 2:  # Error case
+        _, error_msg = result
+        return False, error_msg
+    
+    resp, data, error_msg = result
+    if error_msg:
+        return False, error_msg
+    
     success = bool(data.get("Success", resp.ok))
     message = data.get("Message")
-    result = data.get("Result")
+    cmd_result = data.get("Result")
     parts: List[str] = [f"HTTP {resp.status_code}"]
     if message:
         parts.append(str(message))
-    if result is not None and result != "":
-        parts.append(str(result)[:200])
+    if cmd_result is not None and cmd_result != "":
+        parts.append(str(cmd_result)[:200])
     if len(parts) == 1:
         parts.append(str(data)[:200])
     return success, " | ".join(parts)
 
 
 def _get_json(base_url: str, path: str, ipc_password: str, timeout: int = 10) -> Tuple[bool, Any, str]:
-    url = _ensure_http(base_url).rstrip("/") + path
-    try:
-        resp = requests.get(url, headers=_auth_headers(ipc_password), timeout=timeout)
-    except requests.RequestException as e:
-        return False, None, f"{path}: Connection error: {e}"
-    try:
-        data = resp.json()
-    except ValueError:
-        return False, None, f"{path}: Invalid JSON (HTTP {resp.status_code}): {resp.text[:200]}"
+    """Get JSON data from ASF API."""
+    result = _make_request("GET", base_url, path, ipc_password, timeout)
+    
+    if len(result) == 2:  # Error case
+        _, error_msg = result
+        return False, None, f"{path}: {error_msg}"
+    
+    resp, data, error_msg = result
+    if error_msg:
+        return False, None, f"{path}: {error_msg}"
+    
     if isinstance(data, dict):
         ok = bool(data.get("Success", resp.ok))
         msg = str(data.get("Message", "")) if isinstance(data.get("Message", ""), (str, int, float)) else ""
