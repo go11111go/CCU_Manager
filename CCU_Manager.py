@@ -20,6 +20,7 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Set
 from tkinter import simpledialog
+from datetime import timedelta
 
 import requests
 import tkinter as tk
@@ -499,17 +500,45 @@ class CCUWaveEngine:
         self.command_thread = None
         self.current_interval = None
 
+    def recalculate_global_interval(self):
+        """
+        Пересчитывает и сохраняет общий интервал для всех ботов на текущий цикл работы.
+        """
+        if self.current_phase == "ascending":
+            target_time = self.config.get("time_peak", "20:00")
+        else:
+            target_time = self.config.get("time_bottom", "06:00")
+
+        seconds_available = _time_until(target_time)  # Секунды до следующей фазы (пика или дна)
+        total_bots = self.get_total_bots_count()
+
+        if seconds_available <= 0 or total_bots <= 0:
+            interval = 1.0  # Минимальный интервал на случай ошибок
+        else:
+            interval = seconds_available / total_bots  # Равномерное распределение по оставшемуся времени
+
+        self.logger.info(f"Рассчитанный глобальный интервал: {interval:.2f} секунд")
+
+        # Сохраняем рассчитанный интервал как актуальный для цикла
+        self.current_interval = max(1, interval)
+
     def detect_phase_by_time(self) -> str:
         now_sec = datetime.now().hour * 3600 + datetime.now().minute * 60
         peak_sec = _time_to_seconds(self.config.get("time_peak", "20:00"))
         bottom_sec = _time_to_seconds(self.config.get("time_bottom", "06:00"))
 
-        # обычный случай (дно < пик)
         if bottom_sec < peak_sec:
-            return "ascending" if bottom_sec <= now_sec < peak_sec else "descending"
-
-        # если период через полночь
-        return "ascending" if now_sec >= bottom_sec or now_sec < peak_sec else "descending"
+            # Если "дно" до "пика" (например, 06:00 < 20:00)
+            if bottom_sec <= now_sec < peak_sec:
+                return "ascending"  # Режим "До пика"
+            else:
+                return "descending"  # Режим "До дна"
+        else:
+            # Если "дно" после полуночи, а "пик" до полуночи (например, 22:00 < 06:00)
+            if now_sec >= bottom_sec or now_sec < peak_sec:
+                return "ascending"  # Режим "До пика"
+            else:
+                return "descending"  # Режим "До дна"
 
     def reload_config(self, config: Dict[str, Any]):
         self.config = config
@@ -536,11 +565,18 @@ class CCUWaveEngine:
         return 0, 0
 
     def calculate_step_interval(self, current: int, target: int, seconds_available: int) -> float:
-        diff = abs(target - current)
-        if diff == 0 or seconds_available <= 0:
-            result = float('inf')
+        """
+        Рассчитывает интервал (в секундах) между командами play и reset на каждого бота.
+        """
+        diff = max(1, abs(target - current))  # минимальная разница = 1
+        if seconds_available <= 0:
+            self.logger.warn(
+                "Недостаточно очищенного времени для расчета интервалов. Используется минимальный интервал.")
+            return 1.0
         else:
-            result = seconds_available / diff
+            interval = seconds_available / diff
+            self.logger.info(f"Рассчитанный интервал: {interval:.2f} секунд")
+            return interval
         phase_ru = {
             "ascending": "До пика",
             "descending": "До дна",
@@ -573,6 +609,9 @@ class CCUWaveEngine:
             return value + offset
 
     def sync_bots_state_from_asf(self):
+        """
+        Производит синхронизацию с ASF для получения состояния ботов (онлайн/офлайн).
+        """
         game_id = self.config.get("game_id", 730)
         self.bots_in_game = {}
         self.current_online = 0
@@ -580,25 +619,27 @@ class CCUWaveEngine:
 
         for inst in self.get_active_instances():
             url = inst.get("url", "")
+            # Проверяем состояние серверов
             ok, bots_map, _ = get_bots_asf(url, self.ipc_password)
             if not ok or not bots_map:
                 self.bots_in_game[url] = []
                 continue
 
+            # Отслеживаем количество ботов в игре и общее число ботов
             playing = []
             for bot_name, bot_obj in bots_map.items():
-                state = self._is_bot_playing(bot_obj, game_id)
-                if state is True:
+                # Проверка — находится ли бот в игре
+                if self._is_bot_playing(bot_obj, game_id):
                     playing.append(bot_name)
 
             self.bots_in_game[url] = playing
             count = len(playing)
-            self.current_online += count
-            self.asf_online += count
 
-        self.logger.info(
-            f"Синхронизация с ASF завершена. Онлайн (ASF): {self.asf_online}"
-        )
+            # Обновляем общее количество
+            self.current_online += count
+            self.asf_online += count  # Сохраняем информацию об онлайн через ASF
+
+        self.logger.info(f"Синхронизация с ASF завершена. Онлайн (ASF): {self.asf_online}.")
 
     def collect_all_bots(self):
         self.all_bots.clear()
@@ -641,18 +682,19 @@ class CCUWaveEngine:
             url = inst.get("url", "")
             all_bots = set(self.all_bots.get(url, []))
             in_game = set(self.bots_in_game.get(url, []))
-            available = list(all_bots - in_game)
+            available = list(all_bots - in_game)  # Находим свободных ботов
             bots_per_instance[url] = available
+
         added = 0
         while added < count:
             added_this_round = False
             for url, available in bots_per_instance.items():
                 if available and added < count:
-                    bot = available.pop(0)
+                    bot = available.pop(0)  # Забираем первого доступного бота
                     result.append((url, bot))
                     added += 1
                     added_this_round = True
-            if not added_this_round:
+            if not added_this_round:  # Если нет свободных ботов
                 break
         return result
 
@@ -719,93 +761,65 @@ class CCUWaveEngine:
         return None
 
     def check_and_restore_fallen_bots(self):
-        """Detect bots that should be in game but are offline and log their names.
-        Restoration will be attempted only for bots that were actually tracked as fallen."""
+        """
+        Восстанавливаем упавших ботов. Управляем каждым входом отдельно, не ожидая всех.
+        """
         game_id = self.config.get("game_id", 730)
         instances = self.get_active_instances()
         for inst in instances:
             url = inst.get("url", "")
             name = inst.get("name", url)
 
-            # Ensure trackers exist
-            fallen_set = self._fallen_tracked.setdefault(url, set())
-            attempts_map = self._restore_attempts.setdefault(url, {})
+            # Инициализация трекеров состояний
+            fallen_set = self._fallen_tracked.setdefault(url, set())  # Хранит имена упавших ботов
+            attempts_map = self._restore_attempts.setdefault(url, {})  # Хранит попытки восстановления для каждого бота
 
+            # Получаем список всех ботов, которые должны находиться в игре
             should_be = set(self.bots_in_game.get(url, []))
             ok, bots_map, _ = get_bots_asf(url, self.ipc_password)
             currently_online = set(get_online_bots(url, self.ipc_password)) if ok else set()
 
+            # Боты, вылетевшие из игры
             fallen = should_be - currently_online
-            returned = currently_online & should_be
 
-            # New fallen bots: log and add to tracker
+            # Новые упавшие боты
             new_fallen = sorted(list(fallen - fallen_set))
-            if new_fallen:
-                max_names = 10
-                if len(new_fallen) > max_names:
-                    display = ", ".join(new_fallen[:max_names]) + f", ... (+{len(new_fallen) - max_names})"
-                else:
-                    display = ", ".join(new_fallen)
-                self.logger.alert(f"[{name}] Падение! {len(new_fallen)} ботов отсоединились: {display}")
-                # add to tracked fallen
-                for b in new_fallen:
-                    fallen_set.add(b)
-                    # reset attempts record
-                    attempts_map[b] = (0, 0.0)
+            for bot in new_fallen:
+                self.logger.alert(f"[{name}] Обнаружен вылет аккаунта {bot}, предпринимаем восстановление!")
+                fallen_set.add(bot)
+                attempts_map[bot] = (0, 0.0)  # Инициализация попыток восстановления
 
-            # Process returned bots: only act for those previously tracked as fallen
-            for bot in sorted(returned):
-                if bot not in fallen_set:
-                    # Bot returned but wasn't tracked as fallen -> probably never left or not relevant
-                    # Do not spam logs; optionally log once as info if desired
-                    continue
-
-                # If we have bots_map and details, check if it is already playing the correct game
-                bot_obj = bots_map.get(bot) if (ok and bots_map and bot in bots_map) else {}
-                playing_state = self._is_bot_playing(bot_obj, game_id)
-
-                # If bot already plays the expected game, accept it and remove from fallen tracker without spamming OK
-                if playing_state is True:
-                    self.logger.info(f"[{name}] {bot} вернулся и уже играет — play не нужен")
-                    fallen_set.discard(bot)
-                    if bot in attempts_map:
-                        attempts_map.pop(bot, None)
-                    continue
-
-                # If we know it's definitely not playing, or unknown, attempt restore but obey limits/cooldown
+            # Восстанавливаем соединения
+            for bot in sorted(fallen):
                 count, last_ts = attempts_map.get(bot, (0, 0.0))
                 now_ts = time.time()
+
+                # Пропускаем ботов, с исчерпанными попытками
                 if count >= self._restore_max_attempts:
-                    # Give up further attempts for now, but keep it in fallen_set so we don't spam
-                    # Log once about exhausted attempts
-                    # Only log when threshold reached for the first time
-                    if count == self._restore_max_attempts:
-                        self.logger.warn(f"[{name}] {bot} нуждается в восстановлении — исчерпаны попытки ({count})")
-                        attempts_map[bot] = (count + 1, last_ts)
-                    continue
-                # Check cooldown
-                if now_ts - last_ts < self._restore_cooldown:
-                    # not yet time to retry
                     continue
 
-                # Attempt to send play command once
-                success = False
+                # Пропускаем ботов на кулдауне
+                if now_ts - last_ts < self._restore_cooldown:
+                    continue
+
+                # Пытаемся снова восстановить
                 try:
                     success = self.send_play_command(url, bot, game_id)
                 except Exception:
                     success = False
 
                 if success:
-                    self.logger.ok(f"[{name}] {bot} восстановлен")
+                    self.logger.ok(f"[{name}] Аккаунт {bot} успешно возвращён!")
                     fallen_set.discard(bot)
                     attempts_map.pop(bot, None)
                 else:
-                    # Increase count and update last attempt time
                     attempts_map[bot] = (count + 1, now_ts)
-                    self.logger.warn(
-                        f"[{name}] Не удалось восстановить {bot} (попытка {count + 1}/{self._restore_max_attempts})")
+                    self.logger.warn(f"[{name}] Не удалось вернуть {bot} в игру. Попыток: {count + 1}")
 
     def update_status(self):
+        """
+        Обновляет статус текущего цикла работы двигателя и передаёт обновлённые данные в UI.
+        """
         if self.on_status_update:
             peak, bottom = self.get_current_peak_bottom()
             self.on_status_update(
@@ -817,64 +831,57 @@ class CCUWaveEngine:
             )
 
     def run_wave_cycle(self):
-        url = None
+        """
+        Основной цикл работы:
+        - Определяет текущую фазу (до пика или до дна).
+        - Работает с состоянием ботов.
+        """
         game_id = self.config.get("game_id", 730)
         time_peak = self.config.get("time_peak", "20:00")
         time_bottom = self.config.get("time_bottom", "06:00")
-        delay_config = self.config.get("delay", {})
-        delay_enabled = delay_config.get("enabled", False)
-        delay_after_peak = _parse_hhmm(delay_config.get("delay_after_peak", "00:00")) or 0
-        delay_after_bottom = _parse_hhmm(delay_config.get("delay_after_bottom", "00:00")) or 0
         self.logger.info("=" * 50)
+
+        # Лог названия игры
         game_name = get_game_name(game_id)
-
-        interval = self.current_interval
-
-        if interval is not None and self._last_logged_interval != interval:
-            self.logger.info("[Расчёт интервала]")
-            self.logger.info(
-                f"Режим: {'До пика' if self.current_phase == 'ascending' else 'До дна'}"
-            )
-            self.logger.info(f"Интервал: {interval:.2f} сек.")
-            self._last_logged_interval = interval
-
         if game_name:
             self.logger.info(f"Запуск работы. Игра {game_name} ({game_id})")
         else:
             self.logger.info(f"Запуск работы. Игра ({game_id})")
+
+        # Собираем всех ботов и синхронизируем
         self.collect_all_bots()
-        # 🔧 Принудительная синхронизация состояния с ASF
         self.sync_bots_state_from_asf()
+
         total_bots = self.get_total_bots_count()
         self.logger.info(f"Всего ботов: {total_bots}")
-        # initialize trackers
-        if url is not None:
+
+        # Создаём трекеры состояний для восстановления
+        for inst in self.get_active_instances():
+            url = inst.get("url", "")
             self._fallen_tracked.setdefault(url, set())
             self._restore_attempts.setdefault(url, {})
+
+        # Основной цикл работы
         while self.is_running and not self.stop_event.is_set():
             peak, bottom = self.get_current_peak_bottom()
             if peak == 0 and bottom == 0:
                 self.logger.info("Плавный спад CCU успешно завершен!")
                 self.is_running = False
                 break
-            # 🔧 Определяем фазу строго по времени
+
+            # Определяем фазу работы
             self.current_phase = self.detect_phase_by_time()
-            self.update_status()
-            if self.current_phase == "ascending":
-                seconds_available = _time_until(time_peak)
-                target_value = peak
-            else:
-                seconds_available = _time_until(time_bottom)
-                target_value = bottom
-            if seconds_available > 0:
-                interval = self.calculate_step_interval(
-                    self.current_online,
-                    target_value,
-                    seconds_available
-                )
-                interval = max(1, interval)
-                self.current_interval = interval
-                self.check_and_restore_fallen_bots()
+            self.update_status()  # Обновляем данные для UI
+
+            # Проверка и восстановление упавших ботов
+            self.check_and_restore_fallen_bots()
+
+            # Ждём завершения текущего интервала
+            for _ in range(int(self.current_interval)):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(1)
+
         self.logger.info("Работа завершена")
         self.is_running = False
         self.current_phase = "idle"
@@ -914,9 +921,14 @@ class CCUWaveEngine:
         if self.is_running:
             return
 
+        # Обнуляем текущее состояние перед запуском
         self.is_running = True
         self.stop_event.clear()
-        # 🔧 Режим определяем сразу
+
+        # Пересчёт интервала
+        self.recalculate_global_interval()
+
+        # Режим работы и запуск цикла
         now = datetime.now().hour * 3600 + datetime.now().minute * 60
         peak_sec = _time_to_seconds(self.config.get("time_peak", "20:00"))
         bottom_sec = _time_to_seconds(self.config.get("time_bottom", "06:00"))
@@ -935,7 +947,7 @@ class CCUWaveEngine:
 
         threading.Thread(target=self.run_wave_cycle, daemon=True).start()
 
-        # 🔥 ПОСЛЕ ИНИЦИАЛИЗАЦИИ — ЗАПУСКАЕМ COMMAND WORKER
+        # Включаем worker для команд
         self.command_thread = threading.Thread(
             target=self.command_worker,
             daemon=True
@@ -1315,21 +1327,21 @@ class BotsViewWindow(tk.Toplevel):
         self.refresh()
 
     def refresh(self):
+        """
+        Обновляет данные о состоянии ботов для докладного окна.
+        """
         try:
             url = self.instance.get("url")
             if not url:
                 return
 
-            ok, bots_map, _ = get_bots_asf(
-                url,
-                self.ipc_password,
-                timeout=1.0
-            )
+            # Получаем состояние ботов
+            ok, bots_map, _ = get_bots_asf(url, self.ipc_password)
 
+            # Очищаем дерево перед обновлением
             self.tree.delete(*self.tree.get_children())
 
             total = online = offline = 0
-
             icons = self.app.status_icons
 
             if ok and bots_map:
@@ -1339,11 +1351,8 @@ class BotsViewWindow(tk.Toplevel):
                     if is_online is True:
                         icon = icons["green"]
                         online += 1
-                    elif is_online is False:
-                        icon = icons["gray"]
-                        offline += 1
                     else:
-                        icon = icons["yellow"]
+                        icon = icons["gray"]
                         offline += 1
 
                     self.tree.insert(
@@ -1354,6 +1363,7 @@ class BotsViewWindow(tk.Toplevel):
                     )
                     total += 1
 
+            # Обновляем информацию о состоянии в заголовке окна
             self.info_var.set(f"Всего: {total} | Онлайн: {online} | Офлайн: {offline}")
 
         except Exception:
@@ -2195,6 +2205,9 @@ class CCUManagerApp:
         self.root.after(0, update)
 
     def _on_engine_status_update(self, phase: str, peak: int, bottom: int, online: int, day: int):
+        """
+        Обновляет строку состояния и передаёт информацию о состоянии в UI.
+        """
         instances = self.engine.get_active_instances()
         total_bots = sum(len(self.engine.all_bots.get(inst.get("url", ""), [])) for inst in instances)
         offline = total_bots - online
@@ -2205,6 +2218,7 @@ class CCUManagerApp:
         now = datetime.now()
         today = now.date()
 
+        # Определяем время до пика или дна
         peak_h, peak_m = map(int, time_peak.split(":"))
         bottom_h, bottom_m = map(int, time_bottom.split(":"))
 
@@ -2224,24 +2238,20 @@ class CCUManagerApp:
         else:
             target_text = f"До дна: {_fmt_duration(seconds_to_bottom)} ({time_bottom})"
 
-        phase_ru = {
+        phase_translation = {
             "idle": "Ожидание",
-            "ascending": "В работе ↑",
-            "descending": "В работе ↓",
-            "delay_after_peak": "Задержка (пик)",
-            "delay_after_bottom": "Задержка (дно)"
-        }.get(phase, phase)
+            "ascending": "До пика ↑",
+            "descending": "До дна ↓",
+        }
 
-        asf_online = getattr(self.engine, "asf_online", "---")
+        phase_ru = phase_translation.get(phase, phase)
 
         status = (
             f"Статус: {phase_ru} | День: {day} | "
             f"Пик: {peak} | Дно: {bottom} | "
-            f"Онлайн: {online} | ASF: {asf_online} | "
-            f"Офлайн: {offline} | "
-            f"{target_text}"
+            f"Онлайн (алгоритм): {online} | Онлайн (ASF): {self.engine.asf_online} | "
+            f"Офлайн: {offline} | {target_text}"
         )
-
         self.root.after(0, lambda: self.status_var.set(status))
 
     def _on_server_right_click(self, event):
