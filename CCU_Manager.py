@@ -86,31 +86,46 @@ def _init_status_icons(master):
 # UTILITY
 # ============================================================
 
-_game_name_cache = {}
+class GameNameCache:
+    """Singleton cache for Steam game names."""
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._cache = {}
+        return cls._instance
+    
+    def get(self, app_id: int, timeout=2):
+        """Get game name from cache or fetch from Steam API."""
+        if app_id in self._cache:
+            return self._cache[app_id]
+        
+        try:
+            url = "https://store.steampowered.com/api/appdetails"
+            resp = requests.get(
+                url,
+                params={"appids": app_id, "l": "ru"},
+                timeout=timeout
+            )
+            data = resp.json()
+            app_data = data.get(str(app_id), {})
+            if app_data.get("success"):
+                name = app_data["data"].get("name")
+                if name:
+                    self._cache[app_id] = name
+                    return name
+        except Exception as e:
+            print(f"Warning: Failed to fetch game name for app_id {app_id}: {e}")
+        
+        return None
+
 
 def get_game_name(app_id: int, timeout=2):
     """Fetch game name from Steam API with caching."""
-    if app_id in _game_name_cache:
-        return _game_name_cache[app_id]
+    cache = GameNameCache()
+    return cache.get(app_id, timeout)
 
-    try:
-        url = "https://store.steampowered.com/api/appdetails"
-        resp = requests.get(
-            url,
-            params={"appids": app_id, "l": "ru"},
-            timeout=timeout
-        )
-        data = resp.json()
-        app_data = data.get(str(app_id), {})
-        if app_data.get("success"):
-            name = app_data["data"].get("name")
-            if name:
-                _game_name_cache[app_id] = name
-                return name
-    except Exception as e:
-        print(f"Warning: Failed to fetch game name for app_id {app_id}: {e}")
-
-    return None
 
 def _now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -348,7 +363,7 @@ def fast_port_check(host, port, timeout=0.3):
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
-    except:
+    except Exception:
         return False
 
 
@@ -1097,7 +1112,7 @@ class TimeSpinnerSeparate(ttk.Frame):
         try:
             h, m = map(int, val.split(":"))
             return max(0, min(23, h)), max(0, min(59, m))
-        except:
+        except (ValueError, AttributeError):
             return 0, 0
 
     def _inc_h(self):
@@ -1164,7 +1179,7 @@ class NumberSpinner(ttk.Frame):
     def _increment(self):
         try:
             val = int(self.var.get()) + 1
-        except:
+        except (ValueError, TypeError):
             val = 0
         if self.max_val is not None:
             val = min(val, self.max_val)
@@ -1173,7 +1188,7 @@ class NumberSpinner(ttk.Frame):
     def _decrement(self):
         try:
             val = int(self.var.get()) - 1
-        except:
+        except (ValueError, TypeError):
             val = 0
         if self.min_val is not None:
             val = max(val, self.min_val)
@@ -1734,14 +1749,14 @@ class ConfigEditorCCU(tk.Toplevel):
                     n = r["name"].get()
                     if n.startswith("GAME_"):
                         last_idx = max(last_idx, int(n.replace("GAME_", "")))
-                except:
+                except (ValueError, AttributeError, KeyError):
                     pass
 
                 try:
                     u = r["url"].get()
                     if ":" in u:
                         last_port = max(last_port, int(u.split(":")[-1]))
-                except:
+                except (ValueError, AttributeError, KeyError):
                     pass
 
             name = f"GAME_{last_idx + 1}"
