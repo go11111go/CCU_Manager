@@ -1593,43 +1593,46 @@ class ConfigEditorCCU(tk.Toplevel):
         self.spin_base_days.grid(row=6, column=1, sticky="w", pady=2)
 
         # MIDDLE: randomize & delay
-        self.rand_var = tk.IntVar(value=1 if self.config_data.get("randomize", {}).get("enabled", False) else 0)
+        randomize_cfg = self.config_data.get("randomize", {})
+        self.rand_var = tk.IntVar(value=1 if randomize_cfg.get("enabled", False) else 0)
         self.chk_random = ttk.Checkbutton(middle, text="Рандомизация", variable=self.rand_var,
                                           style="Bold.TCheckbutton")
         self.chk_random.grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Label(middle, text="Тип:").grid(row=1, column=0, sticky="w", pady=2)
-        self.rand_type = tk.StringVar(value=self.config_data.get("randomize", {}).get("type", "percentage"))
+        self.rand_type = tk.StringVar(value=randomize_cfg.get("type", "percentage"))
         self.combo_rand_type = ttk.Combobox(middle, values=["Проценты", "Значения"], textvariable=self.rand_type,
                                             width=12, state="readonly")
         self.combo_rand_type.grid(row=1, column=1, sticky="w", pady=2)
 
         ttk.Label(middle, text="Мин:").grid(row=2, column=0, sticky="w", pady=2)
-        self.spin_rand_min = NumberSpinner(middle, initial_value=self.config_data.get("randomize", {}).get("min", -15),
+        self.spin_rand_min = NumberSpinner(middle, initial_value=randomize_cfg.get("min", -15),
                                            width=6)
         self.spin_rand_min.grid(row=2, column=1, sticky="w", pady=2)
 
         ttk.Label(middle, text="Макс:").grid(row=3, column=0, sticky="w", pady=2)
-        self.spin_rand_max = NumberSpinner(middle, initial_value=self.config_data.get("randomize", {}).get("max", 15),
+        self.spin_rand_max = NumberSpinner(middle, initial_value=randomize_cfg.get("max", 15),
                                            width=6)
         self.spin_rand_max.grid(row=3, column=1, sticky="w", pady=2)
 
-        self.delay_var = tk.IntVar(value=1 if self.config_data.get("delay", {}).get("enabled", False) else 0)
+        delay_cfg = self.config_data.get("delay", {})
+        self.delay_var = tk.IntVar(value=1 if delay_cfg.get("enabled", False) else 0)
         self.chk_delay = ttk.Checkbutton(middle, text="Задержка", variable=self.delay_var, style="Bold.TCheckbutton")
         self.chk_delay.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
         ttk.Label(middle, text="После пика:").grid(row=5, column=0, sticky="w", pady=2)
-        self.delay_after_peak = TimeSpinnerSeparate(middle, initial_value=self.config_data.get("delay", {}).get(
+        self.delay_after_peak = TimeSpinnerSeparate(middle, initial_value=delay_cfg.get(
             "delay_after_peak", "00:00"))
         self.delay_after_peak.grid(row=5, column=1, sticky="w", pady=2)
 
         ttk.Label(middle, text="После дна:").grid(row=6, column=0, sticky="w", pady=2)
-        self.delay_after_bottom = TimeSpinnerSeparate(middle, initial_value=self.config_data.get("delay", {}).get(
+        self.delay_after_bottom = TimeSpinnerSeparate(middle, initial_value=delay_cfg.get(
             "delay_after_bottom", "00:00"))
         self.delay_after_bottom.grid(row=6, column=1, sticky="w", pady=2)
 
         # RIGHT: gradual decay (additional days)
-        self.gradual_var = tk.IntVar(value=1 if self.config_data.get("gradual_decay", {}).get("enabled", False) else 0)
+        gradual_cfg = self.config_data.get("gradual_decay", {})
+        self.gradual_var = tk.IntVar(value=1 if gradual_cfg.get("enabled", False) else 0)
         self.chk_gradual = ttk.Checkbutton(right, text="Включить", variable=self.gradual_var)
         self.chk_gradual.pack(anchor="nw")
 
@@ -1640,7 +1643,7 @@ class ConfigEditorCCU(tk.Toplevel):
         self.gradual_days_container.pack(fill=tk.BOTH, expand=True)
 
         # load existing additional_days
-        additional_days = self.config_data.get("gradual_decay", {}).get("additional_days", [])
+        additional_days = gradual_cfg.get("additional_days", [])
         for day in additional_days:
             self._add_gradual_row(day.get("peak", 0), day.get("bottom", 0))
         # one empty by default
