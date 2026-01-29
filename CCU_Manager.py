@@ -339,6 +339,10 @@ def fast_port_check(host, port, timeout=0.3):
 
 
 def get_bots_asf(base_url: str, ipc_password: str, timeout: int = 10) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+    """
+    Возвращает состояние ботов на сервере ASF.
+    Возвращает (успех, словарь данных, описание ошибки/результат).
+    """
     last_diag = ""
     for path in ("/Api/Bots/ASF", "/Api/Bot/ASF"):
         ok, data, diag = _get_json(base_url, path, ipc_password, timeout=timeout)
@@ -348,7 +352,6 @@ def get_bots_asf(base_url: str, ipc_password: str, timeout: int = 10) -> Tuple[b
             if bots_map:
                 return True, bots_map, diag
     return False, None, last_diag
-
 
 def _get_bool(d: Dict[str, Any], keys: List[str]) -> Optional[bool]:
     for k in keys:
@@ -474,6 +477,9 @@ class CCUWaveEngine:
         self.config = config
         self._last_logged_interval = None
         self.logger = logger
+        self.last_sync_time = None  # Таймстемп последней синхронизации
+        self.sync_interval = 10  # Интервал между синхронизациями (секунды)
+        self.failed_instances = set()  # Набор недоступных серверов
         self.ipc_password = str(config.get("ipc_password", DEFAULT_IPC_PASSWORD) or DEFAULT_IPC_PASSWORD)
         self.is_running = False
         self.stop_event = threading.Event()
@@ -502,24 +508,25 @@ class CCUWaveEngine:
 
     def recalculate_global_interval(self):
         """
-        Пересчитывает и сохраняет общий интервал для всех ботов на текущий цикл работы.
+        Пересчитывает и сохраняет глобальный интервал времени.
         """
         if self.current_phase == "ascending":
             target_time = self.config.get("time_peak", "20:00")
         else:
             target_time = self.config.get("time_bottom", "06:00")
 
-        seconds_available = _time_until(target_time)  # Секунды до следующей фазы (пика или дна)
-        total_bots = self.get_total_bots_count()
+        seconds_available = _time_until(target_time)
+        total_bots = max(1, self.current_online or self.get_total_bots_count())  # Минимум 1 бот
 
-        if seconds_available <= 0 or total_bots <= 0:
-            interval = 1.0  # Минимальный интервал на случай ошибок
+        if seconds_available <= 0:
+            interval = 1.0
+            self.logger.warn("Часы пика истекли. Установлен минимальный интервал: 1 секунда.")
         else:
-            interval = seconds_available / total_bots  # Равномерное распределение по оставшемуся времени
+            interval = seconds_available / total_bots
 
-        self.logger.info(f"Рассчитанный глобальный интервал: {interval:.2f} секунд")
-
-        # Сохраняем рассчитанный интервал как актуальный для цикла
+        # Логируем только если интервал изменился на ±1 секунду
+        if abs(self.current_interval - interval) >= 1:
+            self.logger.info(f"Рассчитанный глобальный интервал: {interval:.2f} секунд")
         self.current_interval = max(1, interval)
 
     def detect_phase_by_time(self) -> str:
@@ -545,6 +552,10 @@ class CCUWaveEngine:
         self.ipc_password = str(config.get("ipc_password", DEFAULT_IPC_PASSWORD) or DEFAULT_IPC_PASSWORD)
 
     def get_active_instances(self) -> List[Dict[str, Any]]:
+        """
+        Возвращает список только активных серверов.
+        Серверы с active=False игнорируются.
+        """
         instances = self.config.get("instances", [])
         return [inst for inst in instances if inst.get("active", True)]
 
@@ -610,8 +621,16 @@ class CCUWaveEngine:
 
     def sync_bots_state_from_asf(self):
         """
-        Производит синхронизацию с ASF для получения состояния ботов (онлайн/офлайн).
+        Производит синхронизацию всех инстансов с ASF, но с учетом интервала синхронизации.
         """
+        now = time.time()
+
+        if self.last_sync_time and now - self.last_sync_time < self.sync_interval:
+            self.logger.info("Синхронизация уже выполнена недавно. Пропуск.")
+            return
+
+        self.last_sync_time = now
+
         game_id = self.config.get("game_id", 730)
         self.bots_in_game = {}
         self.current_online = 0
@@ -619,29 +638,48 @@ class CCUWaveEngine:
 
         for inst in self.get_active_instances():
             url = inst.get("url", "")
-            # Проверяем состояние серверов
-            ok, bots_map, _ = get_bots_asf(url, self.ipc_password)
+            inst_name = inst.get("name", url)
+
+            ok, bots_map, error_message = get_bots_asf(url, self.ipc_password)
+
+            # Проверяем доступность сервера
             if not ok or not bots_map:
+                if inst_name not in self.failed_instances:
+                    self.logger.warn(f"[{inst_name}] Сервер недоступен. Переход в режим оффлайн (всех ботов: 0)")
+                    self.failed_instances.add(inst_name)
                 self.bots_in_game[url] = []
                 continue
+            else:
+                # Если сервер снова стал доступен, удаляем его из списка недоступных
+                if inst_name in self.failed_instances:
+                    self.logger.info(f"[{inst_name}] Сервер снова доступен!")
+                    self.failed_instances.remove(inst_name)
 
-            # Отслеживаем количество ботов в игре и общее число ботов
-            playing = []
-            for bot_name, bot_obj in bots_map.items():
-                # Проверка — находится ли бот в игре
-                if self._is_bot_playing(bot_obj, game_id):
-                    playing.append(bot_name)
+            # Собираем данные о боте
+            playing = [bot_name for bot_name, bot_obj in bots_map.items() if self._is_bot_playing(bot_obj, game_id)]
 
             self.bots_in_game[url] = playing
             count = len(playing)
 
-            # Обновляем общее количество
             self.current_online += count
-            self.asf_online += count  # Сохраняем информацию об онлайн через ASF
+            self.asf_online += len(bots_map)
 
-        self.logger.info(f"Синхронизация с ASF завершена. Онлайн (ASF): {self.asf_online}.")
+            # Если сервер доступен, но все боты оффлайн, добавляем дополнительное сообщение
+            if len(playing) == 0 and bots_map:
+                self.logger.warn(
+                    f"[{inst_name}] Все {len(bots_map)} ботов находятся оффлайн. Проверьте настройки или состояние.")
+
+            self.logger.info(f"[{inst_name}] Состояние: Онлайн {len(playing)}, Оффлайн {len(bots_map) - len(playing)}")
+
+        # Добавьте дополнительную проверку и предупреждения
+        self.logger.info(f"Синхронизация завершена. Общий онлайн (ASF): {self.asf_online}.")
+        if abs(self.asf_online - self.current_online) > 50:  # Если разница 50+ ботов
+            self.logger.warn("Значительное расхождение между ожидаемым и фактическим онлайном.")
 
     def collect_all_bots(self):
+        """
+        Собрать информацию обо всех доступных ботах.
+        """
         self.all_bots.clear()
         instances = self.get_active_instances()
         for inst in instances:
@@ -675,27 +713,25 @@ class CCUWaveEngine:
         return ok
 
     def get_bots_to_add(self, count: int) -> List[Tuple[str, str]]:
+        """
+        Возвращает список ботов, ещё не находящихся в игре, для их запуска.
+        """
         result = []
         instances = self.get_active_instances()
-        bots_per_instance = {}
+
         for inst in instances:
             url = inst.get("url", "")
             all_bots = set(self.all_bots.get(url, []))
-            in_game = set(self.bots_in_game.get(url, []))
-            available = list(all_bots - in_game)  # Находим свободных ботов
-            bots_per_instance[url] = available
+            playing_bots = set(self.bots_in_game.get(url, []))  # Боты, уже в игре
+            available_bots = list(all_bots - playing_bots)  # Только боты, которые не в игре
 
-        added = 0
-        while added < count:
-            added_this_round = False
-            for url, available in bots_per_instance.items():
-                if available and added < count:
-                    bot = available.pop(0)  # Забираем первого доступного бота
-                    result.append((url, bot))
-                    added += 1
-                    added_this_round = True
-            if not added_this_round:  # Если нет свободных ботов
+            bots_to_add = available_bots[:count - len(result)]
+            result.extend([(url, bot) for bot in bots_to_add])
+            if len(result) >= count:
                 break
+
+        if len(result) < count:
+            self.logger.warn("Не хватает ботов для запуска. Проверьте конфигурацию.")
         return result
 
     def get_bots_to_remove(self, count: int) -> List[Tuple[str, str]]:
@@ -832,59 +868,47 @@ class CCUWaveEngine:
 
     def run_wave_cycle(self):
         """
-        Основной цикл работы:
-        - Определяет текущую фазу (до пика или до дна).
-        - Работает с состоянием ботов.
+        Основной цикл работы: управляет фазами "до пика" и "до дна".
         """
         game_id = self.config.get("game_id", 730)
-        time_peak = self.config.get("time_peak", "20:00")
-        time_bottom = self.config.get("time_bottom", "06:00")
         self.logger.info("=" * 50)
 
-        # Лог названия игры
-        game_name = get_game_name(game_id)
-        if game_name:
-            self.logger.info(f"Запуск работы. Игра {game_name} ({game_id})")
-        else:
-            self.logger.info(f"Запуск работы. Игра ({game_id})")
-
-        # Собираем всех ботов и синхронизируем
+        # Единоразовая синхронизация перед запуском
         self.collect_all_bots()
         self.sync_bots_state_from_asf()
-
         total_bots = self.get_total_bots_count()
-        self.logger.info(f"Всего ботов: {total_bots}")
+        self.logger.info(f"Всего ботов: {total_bots} (ONLINE: {self.current_online})")
 
-        # Создаём трекеры состояний для восстановления
-        for inst in self.get_active_instances():
-            url = inst.get("url", "")
-            self._fallen_tracked.setdefault(url, set())
-            self._restore_attempts.setdefault(url, {})
+        # Сохраняем текущую фазу
+        previous_phase = self.current_phase
 
-        # Основной цикл работы
+        # Основной рабочий цикл
         while self.is_running and not self.stop_event.is_set():
-            peak, bottom = self.get_current_peak_bottom()
-            if peak == 0 and bottom == 0:
-                self.logger.info("Плавный спад CCU успешно завершен!")
+            try:
+                # Определяем текущую фазу работы
+                self.current_phase = self.detect_phase_by_time()
+
+                # Выполняем синхронизацию только при смене фазы
+                if self.current_phase != previous_phase:
+                    self.logger.info(
+                        f"Смена фазы с {previous_phase} на {self.current_phase}. Выполняем синхронизацию...")
+                    self.sync_bots_state_from_asf()
+                    previous_phase = self.current_phase  # Обновляем трекер фазы
+
+                # Перерасчёт глобального интервала
+                self.recalculate_global_interval()
+                self.update_status()
+
+                # Проверка и восстановление упавших ботов
+                self.check_and_restore_fallen_bots()
+
+            except Exception as e:
+                self.logger.error(f"Ошибка в основном цикле: {e}")
                 self.is_running = False
                 break
 
-            # Определяем фазу работы
-            self.current_phase = self.detect_phase_by_time()
-            self.update_status()  # Обновляем данные для UI
-
-            # Проверка и восстановление упавших ботов
-            self.check_and_restore_fallen_bots()
-
-            # Ждём завершения текущего интервала
-            for _ in range(int(self.current_interval)):
-                if self.stop_event.is_set():
-                    break
-                time.sleep(1)
-
-        self.logger.info("Работа завершена")
-        self.is_running = False
-        self.current_phase = "idle"
+            # Ждём окончания текущего интервала
+            time.sleep(max(1, self.current_interval))
 
     def command_worker(self):
         self.logger.info("Command worker запущен")
@@ -924,6 +948,10 @@ class CCUWaveEngine:
         # Обнуляем текущее состояние перед запуском
         self.is_running = True
         self.stop_event.clear()
+
+        # Немедленная синхронизация состояния
+        self.recalculate_global_interval()
+        self.update_status()
 
         # Пересчёт интервала
         self.recalculate_global_interval()
@@ -2430,34 +2458,28 @@ class CCUManagerApp:
         TemplatesWindow(self.root)
 
     def start_work(self):
+        """
+        Метод запуска работы.
+        """
         if self.engine.is_running:
-            messagebox.showinfo("Информация", "Работа уже запущена")
+            self.logger.info("Уже выполняется процесс работы.")
             return
-        game_id = self.config.get("game_id")
-        if not game_id:
-            messagebox.showerror("Ошибка", "Game ID не указан в конфиге")
+
+        self.logger.info("Выполняется начальная синхронизация состояния ASF...")
+        self.engine.sync_bots_state_from_asf()
+
+        # Проверяем, есть ли доступные боты для запуска
+        total_bots = sum(len(bots) for bots in self.engine.bots_in_game.values())  # Берём только доступные инстансы
+        if total_bots == 0:
+            self.logger.warn("Не хватает ботов для запуска. Проверьте конфигурацию.")
             return
-        instances = [inst for inst in self.config.get("instances", []) if inst.get("active", True)]
-        if not instances:
-            messagebox.showerror("Ошибка", "Нет активных инстансов")
-            return
-        state = self.engine.load_session_state()
 
-        if state:
-            # Продолжение после остановки
-            self.engine.current_day = state.get("current_day", 1)
-            self.engine.current_online = state.get("current_online", 0)
-            self.engine.bots_in_game = state.get("bots_in_game", {})
-            self.engine.current_phase = state.get("current_phase", "idle")
+        self.logger.info(f"Всего ботов: {total_bots} (ONLINE: {self.engine.current_online})")
 
-            self.engine.start(resume=True)
-        else:
-            # Холодный старт
-            self.engine.start(resume=False)
-
+        # Запуск основного рабочего цикла
+        self.engine.start(resume=False)
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
-        # 🔧 ВСЕГДА разрешаем выделение и копирование лога
         self.log_widget.config(state=tk.NORMAL)
         self.log_widget.focus_set()
 
